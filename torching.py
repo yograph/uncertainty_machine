@@ -141,27 +141,24 @@ class Model(nn.Module):
         self.conv1 = nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5)
         self.pool = nn.MaxPool2d(2, 2)
-        # After conv1 (s=2,p=1,k=4) on 256x256 -> 128x128
-        # After pool 2x2                       -> 64x64
-        # After conv2 (k=5, no pad)            -> 60x60
-        # After pool 2x2                       -> 30x30
-        # Channels = 64, so flattened = 64 * 30 * 30 = 57600
-        self.fc1 = nn.Linear(64 * 30 * 30, 120)
-        self.fc2 = nn.Linear(120, 80)
-        self.fc3 = nn.Linear(80, 32)
-        self.fc4 = nn.Linear(32, 2)
+        # After conv1+pool -> 32x64x64
+        # After conv2+pool -> 64x30x30
+        # GAP averages 30x30 -> 1x1, leaving a 64-dim vector per sample
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(64, 64)
+        self.fc2 = nn.Linear(64, 2)
         self.dropout = nn.Dropout(dropout_variable)
 
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
+        x = self.dropout(x)
         x = self.pool(F.relu(self.conv2(x)))
-        x = torch.flatten(x, 1)  # flatten all dimensions except batch
+        x = self.gap(x)                # (B, 64, 30, 30) -> (B, 64, 1, 1)
+        x = torch.flatten(x, 1)        # -> (B, 64)
         x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = self.dropout(x)  # Apply dropout to the second fully connected layer
-        x = self.fc4(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
         return x
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -178,12 +175,20 @@ train_acc_list = []
 val_loss_list = []
 val_acc_list = []
 
+# Early stopping state
+best_val_loss = float("inf")
+best_state = None
+patience = 5          # epochs without improvement before stopping
+bad_epochs = 0
+
 # Training loop
 for epoch in range(EPOCHS):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
+
+    
 
     for i, (images, labels) in enumerate(train_loader):
         images = images.to(device)
@@ -239,10 +244,26 @@ for epoch in range(EPOCHS):
     val_loss_list.append(val_loss)
     val_acc_list.append(val_accuracy)
 
+    # Early stopping check: save best weights, stop if no improvement
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        bad_epochs = 0
+    else:
+        bad_epochs += 1
+        if bad_epochs >= patience:
+            print(f"Early stopping at epoch {epoch + 1} (best val_loss = {best_val_loss:.4f})")
+            break
+
+# Restore the best-val checkpoint for downstream inference / MC dropout
+if best_state is not None:
+    model.load_state_dict(best_state)
+
 # Plot the training and validation loss curves
+epochs_ran = len(train_loss_list)
 plt.figure()
-plt.plot(range(1, EPOCHS + 1), train_loss_list, label='Training Loss')
-plt.plot(range(1, EPOCHS + 1), val_loss_list, label='Validation Loss')
+plt.plot(range(1, epochs_ran + 1), train_loss_list, label='Training Loss')
+plt.plot(range(1, epochs_ran + 1), val_loss_list, label='Validation Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
 plt.title('Training and Validation Loss')
@@ -251,8 +272,8 @@ plt.show()
 
 # Plot the training and validation accuracy curves
 plt.figure()
-plt.plot(range(1, EPOCHS + 1), train_acc_list, label='Training Accuracy')
-plt.plot(range(1, EPOCHS + 1), val_acc_list, label='Validation Accuracy')
+plt.plot(range(1, epochs_ran + 1), train_acc_list, label='Training Accuracy')
+plt.plot(range(1, epochs_ran + 1), val_acc_list, label='Validation Accuracy')
 plt.xlabel('Epoch')
 plt.ylabel('Accuracy (%)')
 plt.title('Training and Validation Accuracy')
@@ -277,18 +298,20 @@ def monte_carlo_dropout_inference(model, dataloader, num_samples, num_classes):
             # Apply softmax to all 'num_samples' predictions made for that batch, then store them.
             predictions.append(outputs.softmax(dim=-1).cpu().numpy())
 
-    return np.array(predictions)
+    # Concatenate along the batch axis -> (num_samples, total_images, num_classes).
+    # Using concatenate (not np.array) handles the final partial batch correctly.
+    return np.concatenate(predictions, axis=1)
 
 # Perform Monte Carlo Dropout inference
 num_samples = 50
 predictions = monte_carlo_dropout_inference(model, val_loader, num_samples, CLASSES)
 print(predictions.shape)
-# (Number of batches in dataloader, Number of Monte Carlo samples, Number of images in each batch, Number of class)
+# shape: (num_samples, total_val_images, num_classes)
 
 
-# Calculate predictive mean and variance for each batch of samples
-mean_predictions = torch.mean(torch.tensor(predictions), dim=1)
-var_predictions = torch.var(torch.tensor(predictions), dim=1)
+# Predictive mean and variance over the MC sample axis (axis 0)
+mean_predictions = predictions.mean(axis=0)   # (total_val_images, num_classes)
+var_predictions  = predictions.var(axis=0)    # (total_val_images, num_classes)
 
 print(mean_predictions.shape)
 
@@ -299,13 +322,15 @@ def transform_image(image):
     transformed_image = (image - image_min) / (image_max - image_min)
     return transformed_image
 
-# Show uncertainty estimates for a random image
+# Show uncertainty estimates for a single image from the val set
 image_index = 1
-batch_index = 0
 
-class_names = ["B (Zebra)", "A (Horse)"]
-image = val_loader[image_index][0]  # Get the image tensor
-true_label = class_names[val_loader[image_index][1]]  # Get the true label
+# label=0 -> horses (folder A), label=1 -> zebras (folder B). Index matches that.
+class_names = ["A (Horse)", "B (Zebra)"]
+
+# DataLoaders aren't indexable; pull the sample directly from the underlying dataset.
+image, label = val_loader.dataset[image_index]
+true_label = class_names[label]
 
 # Convert the image tensor to a NumPy array and transpose the dimensions
 image = np.transpose(image.numpy(), (1, 2, 0))
@@ -317,15 +342,15 @@ plt.title('True Label: ' + true_label)
 plt.show()
 
 # Display uncertainty estimates for each class
-for i in range(10):
+for i in range(CLASSES):
     class_name = class_names[i]
-    mean_prediction = mean_predictions[batch_index][image_index][i]
-    variance_prediction = var_predictions[batch_index][image_index][i]
-    print(f"{class_name} - Mean: {mean_prediction}, Variance: {variance_prediction}")
+    mean_prediction = mean_predictions[image_index][i]
+    variance_prediction = var_predictions[image_index][i]
+    print(f"{class_name} - Mean: {mean_prediction:.4f}, Variance: {variance_prediction:.6f}")
 
 # Visualize the uncertainty for each class
 plt.figure()
-plt.bar(class_names, mean_predictions[batch_index][image_index], yerr=np.sqrt(var_predictions[batch_index][image_index]))
+plt.bar(class_names, mean_predictions[image_index], yerr=np.sqrt(var_predictions[image_index]))
 plt.xlabel('Class')
 plt.ylabel('Probability')
 plt.title('Predicted Probabilities with Uncertainty')
