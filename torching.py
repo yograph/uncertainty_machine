@@ -282,12 +282,23 @@ plt.show()
 
 # Loss and Accuracy on Validation set it better than on Training set because of dropout
 
+def enable_mc_dropout(model):
+    # eval() everywhere, then switch ONLY the dropout layers back to train mode.
+    # Plain model.train() would also flip layers like BatchNorm into training
+    # behaviour, which corrupts the predictions.
+    model.eval()
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.train()
+
+
 # Define a function for Monte Carlo Dropout inference
 def monte_carlo_dropout_inference(model, dataloader, num_samples, num_classes):
-    model.train()
+    enable_mc_dropout(model)
     predictions = []
+    all_labels = []
     with torch.no_grad():
-        for images, _ in dataloader:
+        for images, labels in dataloader:
             images = images.to(device)
             outputs = torch.zeros((num_samples, images.size(0), num_classes)).to(device)
 
@@ -297,14 +308,15 @@ def monte_carlo_dropout_inference(model, dataloader, num_samples, num_classes):
 
             # Apply softmax to all 'num_samples' predictions made for that batch, then store them.
             predictions.append(outputs.softmax(dim=-1).cpu().numpy())
+            all_labels.append(labels.numpy())
 
     # Concatenate along the batch axis -> (num_samples, total_images, num_classes).
     # Using concatenate (not np.array) handles the final partial batch correctly.
-    return np.concatenate(predictions, axis=1)
+    return np.concatenate(predictions, axis=1), np.concatenate(all_labels)
 
 # Perform Monte Carlo Dropout inference
 num_samples = 50
-predictions = monte_carlo_dropout_inference(model, val_loader, num_samples, CLASSES)
+predictions, val_labels = monte_carlo_dropout_inference(model, val_loader, num_samples, CLASSES)
 print(predictions.shape)
 # shape: (num_samples, total_val_images, num_classes)
 
@@ -314,6 +326,53 @@ mean_predictions = predictions.mean(axis=0)   # (total_val_images, num_classes)
 var_predictions  = predictions.var(axis=0)    # (total_val_images, num_classes)
 
 print(mean_predictions.shape)
+
+# ---------------------------------------------------------------------------
+# Uncertainty decomposition
+#
+# Total uncertainty   = predictive entropy H[ E[p] ]
+# Aleatoric (data)    = expected entropy   E[ H[p] ]   (noise the model cannot
+#                                                       remove with more data)
+# Epistemic (model)   = mutual information = total - aleatoric  (uncertainty
+#                       about the weights; shrinks with more training data)
+# ---------------------------------------------------------------------------
+eps = 1e-12
+
+# Entropy of the averaged prediction -> total uncertainty, shape (N,)
+predictive_entropy = -np.sum(mean_predictions * np.log(mean_predictions + eps), axis=1)
+
+# Average entropy of each individual MC prediction -> aleatoric, shape (N,)
+expected_entropy = -np.mean(
+    np.sum(predictions * np.log(predictions + eps), axis=2), axis=0
+)
+
+# Mutual information between prediction and weights -> epistemic, shape (N,)
+mutual_information = predictive_entropy - expected_entropy
+
+print(f"Mean predictive entropy (total):     {predictive_entropy.mean():.4f}")
+print(f"Mean expected entropy (aleatoric):   {expected_entropy.mean():.4f}")
+print(f"Mean mutual information (epistemic): {mutual_information.mean():.4f}")
+
+# Is the uncertainty useful? Compare it for correct vs. wrong predictions:
+# a good uncertainty estimate should be higher on the mistakes.
+pred_labels = mean_predictions.argmax(axis=1)
+correct_mask = pred_labels == val_labels
+mc_accuracy = 100 * correct_mask.mean()
+print(f"MC-dropout val accuracy: {mc_accuracy:.2f}%")
+print(f"Mean entropy on correct predictions: {predictive_entropy[correct_mask].mean():.4f}")
+if (~correct_mask).any():
+    print(f"Mean entropy on wrong predictions:   {predictive_entropy[~correct_mask].mean():.4f}")
+
+# Distribution of total uncertainty over the validation set
+plt.figure()
+plt.hist(predictive_entropy[correct_mask], bins=30, alpha=0.6, label='Correct')
+if (~correct_mask).any():
+    plt.hist(predictive_entropy[~correct_mask], bins=30, alpha=0.6, label='Wrong')
+plt.xlabel('Predictive Entropy')
+plt.ylabel('Number of Images')
+plt.title('Uncertainty Distribution (MC Dropout)')
+plt.legend()
+plt.show()
 
 def transform_image(image):
     # Min-max scaling to transform image tensor from -1 to 1 to 0 to 1
@@ -356,3 +415,22 @@ plt.ylabel('Probability')
 plt.title('Predicted Probabilities with Uncertainty')
 plt.xticks(rotation=45)
 plt.show()
+
+# Show the validation images the model is most and least certain about
+def show_examples(indices, title):
+    fig, axes = plt.subplots(1, len(indices), figsize=(4 * len(indices), 4))
+    for ax, idx in zip(np.atleast_1d(axes), indices):
+        img, lbl = val_loader.dataset[idx]
+        ax.imshow(transform_image(np.transpose(img.numpy(), (1, 2, 0))))
+        ax.axis('off')
+        ax.set_title(f"true: {class_names[lbl]}\n"
+                     f"pred: {class_names[pred_labels[idx]]}\n"
+                     f"H={predictive_entropy[idx]:.3f}  MI={mutual_information[idx]:.3f}")
+    fig.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+order = np.argsort(predictive_entropy)
+n_show = min(3, len(order))
+show_examples(order[:n_show], 'Most certain predictions')
+show_examples(order[-n_show:][::-1], 'Most uncertain predictions')
