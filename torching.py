@@ -6,8 +6,10 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
+from torchvision.transforms import functional as TF
 import matplotlib.pyplot as plt
 import torch.nn as nn
+from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
 
 IMAGE_SIZE = 256
 BATCH_SIZE = 32
@@ -17,10 +19,11 @@ LEARNING_RATE = 0.0005
 CLASSES = 2
 
 
-PATH_OF_TEST_A = "/Users/youseffarahat/Documents/uncertainty_machine/horse2zebra/testA"
-PATH_OF_TEST_B = "/Users/youseffarahat/Documents/uncertainty_machine/horse2zebra/testB"
-PATH_OF_TRAIN_A = "/Users/youseffarahat/Documents/uncertainty_machine/horse2zebra/trainA"
-PATH_OF_TRAIN_B = "/Users/youseffarahat/Documents/uncertainty_machine/horse2zebra/trainB"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PATH_OF_TEST_A = os.path.join(BASE_DIR, "testA")
+PATH_OF_TEST_B = os.path.join(BASE_DIR, "testB")
+PATH_OF_TRAIN_A = os.path.join(BASE_DIR, "trainA")
+PATH_OF_TRAIN_B = os.path.join(BASE_DIR, "trainB")
 
 
 def get_image_paths(folder):
@@ -363,6 +366,18 @@ print(f"Mean entropy on correct predictions: {predictive_entropy[correct_mask].m
 if (~correct_mask).any():
     print(f"Mean entropy on wrong predictions:   {predictive_entropy[~correct_mask].mean():.4f}")
 
+cm = confusion_matrix(val_labels, pred_labels)
+print("\nConfusion Matrix:")
+print(cm)
+print("\nClassification Report:")
+print(classification_report(val_labels, pred_labels, target_names=["A (Horse)", "B (Zebra)"]))
+
+fig, ax = plt.subplots()
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["A (Horse)", "B (Zebra)"])
+disp.plot(ax=ax, cmap='Blues')
+plt.title('Confusion Matrix (MC Dropout)')
+plt.show()
+
 # Distribution of total uncertainty over the validation set
 plt.figure()
 plt.hist(predictive_entropy[correct_mask], bins=30, alpha=0.6, label='Correct')
@@ -425,7 +440,7 @@ def show_examples(indices, title):
         ax.axis('off')
         ax.set_title(f"true: {class_names[lbl]}\n"
                      f"pred: {class_names[pred_labels[idx]]}\n"
-                     f"H={predictive_entropy[idx]:.3f}  MI={mutual_information[idx]:.3f}")
+                     f"entropy={predictive_entropy[idx]:.3f}  epistemic={mutual_information[idx]:.3f}")
     fig.suptitle(title)
     plt.tight_layout()
     plt.show()
@@ -434,3 +449,109 @@ order = np.argsort(predictive_entropy)
 n_show = min(3, len(order))
 show_examples(order[:n_show], 'Most certain predictions')
 show_examples(order[-n_show:][::-1], 'Most uncertain predictions')
+
+# Harder cases: corrupted images
+class CorruptedDataset(Dataset):
+    def __init__(self, base_dataset, corruption_fn):
+        self.base_dataset = base_dataset
+        self.corruption_fn = corruption_fn
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, index):
+        img, label = self.base_dataset[index]
+        img = self.corruption_fn(img)
+        return img, label
+
+
+def add_gaussian_noise(img, std=0.3):
+    return img + torch.randn_like(img) * std
+
+def apply_blur(img, kernel_size=15, sigma=5.0):
+    return TF.gaussian_blur(img, kernel_size=[kernel_size, kernel_size], sigma=sigma)
+
+def apply_center_crop(img, crop_fraction=0.5):
+    _, h, w = img.shape
+    crop_size = int(min(h, w) * crop_fraction)
+    img = TF.center_crop(img, [crop_size, crop_size])
+    img = TF.resize(img, [h, w])
+    return img
+
+
+corruption_configs = {
+    'Clean': None,
+    'Gaussian Noise': lambda img: add_gaussian_noise(img, std=0.3),
+    'Blurred': lambda img: apply_blur(img, kernel_size=15, sigma=5.0),
+    'Center Crop (50%)': lambda img: apply_center_crop(img, crop_fraction=0.5),
+}
+
+results_harder = {}
+
+for name, corruption_fn in corruption_configs.items():
+    if corruption_fn is None:
+        loader = val_loader
+    else:
+        corrupted_ds = CorruptedDataset(val_loader.dataset, corruption_fn)
+        loader = DataLoader(corrupted_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    preds, labels = monte_carlo_dropout_inference(model, loader, num_samples, CLASSES)
+    mean_preds = preds.mean(axis=0)
+
+    predictive_entropy_c = -np.sum(mean_preds * np.log(mean_preds + eps), axis=1)
+    expected_entropy_c = -np.mean(np.sum(preds * np.log(preds + eps), axis=2), axis=0)
+    mutual_information_c = predictive_entropy_c - expected_entropy_c
+
+    pred_cls = mean_preds.argmax(axis=1)
+    acc = 100 * (pred_cls == labels).mean()
+
+    results_harder[name] = {
+        'accuracy': acc,
+        'total_entropy': predictive_entropy_c.mean(),
+        'aleatoric': expected_entropy_c.mean(),
+        'epistemic': mutual_information_c.mean(),
+    }
+    print(f"\n--- {name} ---")
+    print(f"  Accuracy:  {acc:.2f}%")
+    print(f"  Total entropy (predictive): {predictive_entropy_c.mean():.4f}")
+    print(f"  Aleatoric (expected entropy): {expected_entropy_c.mean():.4f}")
+    print(f"  Epistemic (mutual information): {mutual_information_c.mean():.4f}")
+
+# Bar chart comparing uncertainty across conditions
+condition_names = list(results_harder.keys())
+total_vals = [results_harder[c]['total_entropy'] for c in condition_names]
+aleatoric_vals = [results_harder[c]['aleatoric'] for c in condition_names]
+epistemic_vals = [results_harder[c]['epistemic'] for c in condition_names]
+
+x = np.arange(len(condition_names))
+width = 0.25
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.bar(x - width, total_vals, width, label='Total (Predictive Entropy)')
+ax.bar(x, aleatoric_vals, width, label='Aleatoric (Expected Entropy)')
+ax.bar(x + width, epistemic_vals, width, label='Epistemic (Mutual Information)')
+ax.set_ylabel('Uncertainty')
+ax.set_title('Uncertainty Under Different Conditions')
+ax.set_xticks(x)
+ax.set_xticklabels(condition_names, rotation=20, ha='right')
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# Show example corrupted images
+sample_img, sample_lbl = val_loader.dataset[0]
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+titles = ['Clean', 'Gaussian Noise', 'Blurred', 'Center Crop (50%)']
+images_to_show = [
+    sample_img,
+    add_gaussian_noise(sample_img, std=0.3),
+    apply_blur(sample_img, kernel_size=15, sigma=5.0),
+    apply_center_crop(sample_img, crop_fraction=0.5),
+]
+for ax, img, title in zip(axes, images_to_show, titles):
+    ax.imshow(transform_image(np.transpose(img.numpy(), (1, 2, 0))))
+    ax.set_title(title)
+    ax.axis('off')
+fig.suptitle('Example Corrupted Images')
+plt.tight_layout()
+plt.show()

@@ -1,3 +1,6 @@
+# virtual environment
+.venv/
+
 # dataset artifacts
 horse2zebra.zip
 horse2zebra/trainA/
