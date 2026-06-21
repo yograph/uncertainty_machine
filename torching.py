@@ -1,5 +1,7 @@
 import os
 import random
+from typing import Callable, Collection, Optional, Sequence
+
 import numpy as np
 from PIL import Image
 
@@ -26,7 +28,15 @@ PATH_OF_TRAIN_A = os.path.join(BASE_DIR, "trainA")
 PATH_OF_TRAIN_B = os.path.join(BASE_DIR, "trainB")
 
 
-def get_image_paths(folder):
+def get_image_paths(folder: str) -> list[str]:
+    """Return sorted image file paths from a folder.
+
+    Args:
+        folder: Directory to scan for image files.
+
+    Returns:
+        list[str]: Sorted paths ending in .jpg, .jpeg, or .png.
+    """
     exts = (".jpg", ".jpeg", ".png")
     paths = sorted([
         os.path.join(folder, f)
@@ -36,19 +46,45 @@ def get_image_paths(folder):
     return paths
 
 
-# print(get_image_paths(PATH_OF_TRAIN_A))
 
 
 class ImageFolderDataset(Dataset):
-    def __init__(self, paths, label, transform=None):
+    """Dataset that loads RGB images from paths and assigns one fixed label."""
+
+    def __init__(
+        self,
+        paths: Sequence[str],
+        label: int,
+        transform: Optional[Callable[[Image.Image], torch.Tensor]] = None,
+    ) -> None:
+        """Store image paths, their shared label, and an optional transform.
+
+        Args:
+            paths: Image file paths to load.
+            label: Class label returned for every image in this dataset.
+            transform: Optional torchvision transform applied to each image.
+        """
         self.paths = paths
         self.label = label
         self.transform = transform
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of image paths in the dataset.
+
+        Returns:
+            int: Number of image paths.
+        """
         return len(self.paths)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> tuple[torch.Tensor | Image.Image, int]:
+        """Load, transform, and return one image-label pair.
+
+        Args:
+            index: Position of the image to load.
+
+        Returns:
+            tuple[torch.Tensor | Image.Image, int]: Image and fixed class label.
+        """
         path = self.paths[index]
 
         img = Image.open(path).convert("RGB")
@@ -59,8 +95,6 @@ class ImageFolderDataset(Dataset):
         return img, self.label
 
 
-# Equivalent to:
-# resize 286 -> random crop 256 -> random horizontal flip -> normalise to [-1, 1]
 train_transform = T.Compose([
     T.Resize((286, 286)),
     T.RandomCrop((IMAGE_SIZE, IMAGE_SIZE)),
@@ -71,8 +105,7 @@ train_transform = T.Compose([
 ])
 
 
-# Equivalent to:
-# resize 256 -> normalise to [-1, 1]
+
 test_transform = T.Compose([
     T.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     T.ToTensor(),
@@ -132,28 +165,35 @@ test_loader = DataLoader(
 )
 
 
-# print(f"Train A: {len(train_a_paths)}, Train B: {len(train_b_paths)}")
-# print(f"Val A: {len(val_a_paths)}, Val B: {len(val_b_paths)}")
-# print(f"Test A: {len(test_a_paths)}, Test B: {len(test_b_paths)}")
 
 import torch.nn.functional as F
 class Model(nn.Module):
-    def __init__(self, dropout_variable = 0.5):
+    def __init__(self, dropout_variable: float = 0.5) -> None:
+        """Initialize the convolutional classifier.
+
+        Args:
+            dropout_variable: Probability used by dropout layers.
+        """
         super().__init__()
 
         self.conv1 = nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5)
         self.pool = nn.MaxPool2d(2, 2)
-        # After conv1+pool -> 32x64x64
-        # After conv2+pool -> 64x30x30
-        # GAP averages 30x30 -> 1x1, leaving a 64-dim vector per sample
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.fc1 = nn.Linear(64, 64)
         self.fc2 = nn.Linear(64, 2)
         self.dropout = nn.Dropout(dropout_variable)
 
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run a forward pass and return raw class logits.
+
+        Args:
+            x: Batch of image tensors with shape (batch, 3, height, width).
+
+        Returns:
+            torch.Tensor: Logits with shape (batch, 2).
+        """
         x = self.pool(F.relu(self.conv1(x)))
         x = self.dropout(x)
         x = self.pool(F.relu(self.conv2(x)))
@@ -172,26 +212,21 @@ criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 
-# Lists to store training and validation metrics
 train_loss_list = []
 train_acc_list = []
 val_loss_list = []
 val_acc_list = []
 
-# Early stopping state
 best_val_loss = float("inf")
 best_state = None
 patience = 5          # epochs without improvement before stopping
 bad_epochs = 0
 
-# Training loop
 for epoch in range(EPOCHS):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
-
-    
 
     for i, (images, labels) in enumerate(train_loader):
         images = images.to(device)
@@ -285,10 +320,12 @@ plt.show()
 
 # Loss and Accuracy on Validation set it better than on Training set because of dropout
 
-def enable_mc_dropout(model):
-    # eval() everywhere, then switch ONLY the dropout layers back to train mode.
-    # Plain model.train() would also flip layers like BatchNorm into training
-    # behaviour, which corrupts the predictions.
+def enable_mc_dropout(model: nn.Module) -> None:
+    """Enable dropout during inference while leaving the rest of the model in evaluation mode.
+
+    Args:
+        model: PyTorch model containing dropout modules.
+    """
     model.eval()
     for module in model.modules():
         if isinstance(module, nn.Dropout):
@@ -296,7 +333,25 @@ def enable_mc_dropout(model):
 
 
 # Define a function for Monte Carlo Dropout inference
-def monte_carlo_dropout_inference(model, dataloader, num_samples, num_classes):
+def monte_carlo_dropout_inference(
+    model: nn.Module,
+    dataloader: DataLoader,
+    num_samples: int,
+    num_classes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate predictive distributions with repeated dropout-enabled passes.
+
+    Args:
+        model: Trained classifier to evaluate.
+        dataloader: DataLoader returning image batches and labels.
+        num_samples: Number of stochastic forward passes per batch.
+        num_classes: Number of output classes.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Predictions with shape
+        (num_samples, total_images, num_classes) and labels with shape
+        (total_images,).
+    """
     enable_mc_dropout(model)
     predictions = []
     all_labels = []
@@ -305,16 +360,12 @@ def monte_carlo_dropout_inference(model, dataloader, num_samples, num_classes):
             images = images.to(device)
             outputs = torch.zeros((num_samples, images.size(0), num_classes)).to(device)
 
-            # For each batch in the dataloader, 'num_samples' predictions are being made
             for i in range(num_samples):
                 outputs[i] = model(images)
 
-            # Apply softmax to all 'num_samples' predictions made for that batch, then store them.
             predictions.append(outputs.softmax(dim=-1).cpu().numpy())
             all_labels.append(labels.numpy())
 
-    # Concatenate along the batch axis -> (num_samples, total_images, num_classes).
-    # Using concatenate (not np.array) handles the final partial batch correctly.
     return np.concatenate(predictions, axis=1), np.concatenate(all_labels)
 
 # Perform Monte Carlo Dropout inference
@@ -330,15 +381,7 @@ var_predictions  = predictions.var(axis=0)    # (total_val_images, num_classes)
 
 print(mean_predictions.shape)
 
-# ---------------------------------------------------------------------------
-# Uncertainty decomposition
-#
-# Total uncertainty   = predictive entropy H[ E[p] ]
-# Aleatoric (data)    = expected entropy   E[ H[p] ]   (noise the model cannot
-#                                                       remove with more data)
-# Epistemic (model)   = mutual information = total - aleatoric  (uncertainty
-#                       about the weights; shrinks with more training data)
-# ---------------------------------------------------------------------------
+
 eps = 1e-12
 
 # Entropy of the averaged prediction -> total uncertainty, shape (N,)
@@ -356,8 +399,7 @@ print(f"Mean predictive entropy (total):     {predictive_entropy.mean():.4f}")
 print(f"Mean expected entropy (aleatoric):   {expected_entropy.mean():.4f}")
 print(f"Mean mutual information (epistemic): {mutual_information.mean():.4f}")
 
-# Is the uncertainty useful? Compare it for correct vs. wrong predictions:
-# a good uncertainty estimate should be higher on the mistakes.
+
 pred_labels = mean_predictions.argmax(axis=1)
 correct_mask = pred_labels == val_labels
 mc_accuracy = 100 * correct_mask.mean()
@@ -389,8 +431,15 @@ plt.title('Uncertainty Distribution (MC Dropout)')
 plt.legend()
 plt.show()
 
-def transform_image(image):
-    # Min-max scaling to transform image tensor from -1 to 1 to 0 to 1
+def transform_image(image: np.ndarray) -> np.ndarray:
+    """Scale an image array to the 0-1 range for display.
+
+    Args:
+        image: NumPy array containing image values.
+
+    Returns:
+        np.ndarray: Min-max normalized image array.
+    """
     image_min = np.min(image)
     image_max = np.max(image)
     transformed_image = (image - image_min) / (image_max - image_min)
@@ -432,7 +481,13 @@ plt.xticks(rotation=45)
 plt.show()
 
 # Show the validation images the model is most and least certain about
-def show_examples(indices, title):
+def show_examples(indices: Collection[int], title: str) -> None:
+    """Display validation examples with true labels, predictions, and uncertainty.
+
+    Args:
+        indices: Iterable of validation-set indices to visualize.
+        title: Figure title.
+    """
     fig, axes = plt.subplots(1, len(indices), figsize=(4 * len(indices), 4))
     for ax, idx in zip(np.atleast_1d(axes), indices):
         img, lbl = val_loader.dataset[idx]
@@ -452,26 +507,79 @@ show_examples(order[-n_show:][::-1], 'Most uncertain predictions')
 
 # Harder cases: corrupted images
 class CorruptedDataset(Dataset):
-    def __init__(self, base_dataset, corruption_fn):
+    """Dataset wrapper that applies a corruption function to each image."""
+
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        corruption_fn: Callable[[torch.Tensor], torch.Tensor],
+    ) -> None:
+        """Store the source dataset and corruption function.
+
+        Args:
+            base_dataset: Dataset returning (image, label) pairs.
+            corruption_fn: Function applied to each image tensor.
+        """
         self.base_dataset = base_dataset
         self.corruption_fn = corruption_fn
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of examples in the wrapped dataset.
+
+        Returns:
+            int: Number of examples in the wrapped dataset.
+        """
         return len(self.base_dataset)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        """Return one corrupted image and its original label.
+
+        Args:
+            index: Position of the sample in the wrapped dataset.
+
+        Returns:
+            tuple[torch.Tensor, int]: Corrupted image and original label.
+        """
         img, label = self.base_dataset[index]
         img = self.corruption_fn(img)
         return img, label
 
 
-def add_gaussian_noise(img, std=0.3):
+def add_gaussian_noise(img: torch.Tensor, std: float = 0.3) -> torch.Tensor:
+    """Add Gaussian noise to an image tensor.
+
+    Args:
+        img: Image tensor to corrupt.
+        std: Standard deviation of the sampled noise.
+
+    Returns:
+        torch.Tensor: Noisy image tensor.
+    """
     return img + torch.randn_like(img) * std
 
-def apply_blur(img, kernel_size=15, sigma=5.0):
+def apply_blur(img: torch.Tensor, kernel_size: int = 15, sigma: float = 5.0) -> torch.Tensor:
+    """Apply Gaussian blur to an image tensor.
+
+    Args:
+        img: Image tensor to corrupt.
+        kernel_size: Width and height of the Gaussian kernel.
+        sigma: Standard deviation for the Gaussian kernel.
+
+    Returns:
+        torch.Tensor: Blurred image tensor.
+    """
     return TF.gaussian_blur(img, kernel_size=[kernel_size, kernel_size], sigma=sigma)
 
-def apply_center_crop(img, crop_fraction=0.5):
+def apply_center_crop(img: torch.Tensor, crop_fraction: float = 0.5) -> torch.Tensor:
+    """Crop the center of an image tensor and resize it back to the original size.
+
+    Args:
+        img: Image tensor with shape (channels, height, width).
+        crop_fraction: Fraction of the shortest side to keep before resizing.
+
+    Returns:
+        torch.Tensor: Center-cropped and resized image tensor.
+    """
     _, h, w = img.shape
     crop_size = int(min(h, w) * crop_fraction)
     img = TF.center_crop(img, [crop_size, crop_size])
